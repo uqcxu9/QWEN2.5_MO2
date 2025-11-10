@@ -20,7 +20,133 @@ with open('config.yaml', "r") as f:
     run_configuration = yaml.safe_load(f)
 env_config = run_configuration.get('env')
         
-def gpt_actions(env, obs, dialog_queue, dialog4ref_queue, gpt_path, gpt_error, total_cost):
+def enforce_constraints(env, obs, actions, prev_obs):
+    """
+    强制修正违反经济学约束的agent行为
+    
+    修正3个微观约束：
+    1. MPC约束 [0.05, 0.9]
+    2. 储蓄率约束 [0.014, 0.318]
+    3. 失业率约束 [0.035, 0.148]
+    """
+    modified_actions = {}
+    
+    # ========== 第1步：个体约束修正 ==========
+    for idx in range(env.num_agents):
+        agent_id = str(idx)
+        this_agent = env.get_agent(agent_id)
+        
+        # 提取当前决策
+        work_decision = actions[agent_id][0]  # 0或1
+        consumption_prop = actions[agent_id][1] * 0.02  # 转回比例[0, 1]
+        
+        # 计算当期财务状况
+        curr_wealth = this_agent.inventory['Coin']
+        max_l = env._components_dict['SimpleLabor'].num_labor_hours
+        curr_potential_income = this_agent.state['skill'] * max_l * work_decision
+        
+        # ========== 约束1: MPC修正 ==========
+        if prev_obs is not None and env.world.timestep > 0:
+            try:
+                # 上期数据
+                prev_states = env.dense_log['states'][-1] if len(env.dense_log['states']) > 0 else None
+                if prev_states is not None:
+                    prev_income = prev_states[agent_id]['income']['Coin']
+                    prev_consumption = prev_states[agent_id]['consumption']['Coin']
+                    
+                    # 上期税务数据
+                    prev_tax_data = env.dense_log['PeriodicTax'][-1] if len(env.dense_log['PeriodicTax']) > 0 else {}
+                    prev_tax = prev_tax_data.get(agent_id, {}).get('tax_paid', 0)
+                    
+                    # 当期税务数据
+                    curr_tax = obs['p'][f'p{idx}']['PeriodicBracketTax-tax_paid']
+                    lump_sum = obs['p'][f'p{idx}']['PeriodicBracketTax-lump_sum']
+                    
+                    # 计算DPI变化
+                    prev_dpi = prev_income - prev_tax
+                    curr_dpi = curr_potential_income + lump_sum - curr_tax
+                    delta_dpi = curr_dpi - prev_dpi
+                    
+                    # 计算消费变化
+                    planned_consumption = consumption_prop * (curr_wealth + curr_potential_income)
+                    delta_consumption = planned_consumption - prev_consumption
+                    
+                    # 检查MPC
+                    if abs(delta_dpi) > 100:
+                        mpc = delta_consumption / delta_dpi
+                        
+                        if mpc < 0.05:
+                            target_consumption = prev_consumption + 0.05 * delta_dpi
+                            consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
+                            consumption_prop = max(0.02, min(1.0, consumption_prop))
+                            
+                        elif mpc > 0.9:
+                            target_consumption = prev_consumption + 0.9 * delta_dpi
+                            consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
+                            consumption_prop = max(0.02, min(1.0, consumption_prop))
+            except:
+                pass
+        
+        # ========== 约束2: 储蓄率修正 ==========
+        try:
+            tax_paid = obs['p'][f'p{idx}']['PeriodicBracketTax-tax_paid']
+            lump_sum = obs['p'][f'p{idx}']['PeriodicBracketTax-lump_sum']
+            
+            dpi = curr_potential_income + lump_sum - tax_paid
+            planned_consumption = consumption_prop * (curr_wealth + curr_potential_income)
+            saving = dpi - planned_consumption
+            
+            if dpi > 100:
+                saving_rate = saving / dpi
+                
+                if saving_rate < 0.014:
+                    target_saving = 0.014 * dpi
+                    target_consumption = dpi - target_saving
+                    consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
+                    consumption_prop = max(0.02, min(1.0, consumption_prop))
+                    
+                elif saving_rate > 0.318:
+                    target_saving = 0.318 * dpi
+                    target_consumption = dpi - target_saving
+                    consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
+                    consumption_prop = max(0.02, min(1.0, consumption_prop))
+        except:
+            pass
+        
+        # 保存修正后的决策
+        modified_actions[agent_id] = [work_decision, int(consumption_prop / 0.02)]
+    
+    # ========== 第2步：全局失业率调整 ==========
+    unemployed = sum(1 for idx in range(env.num_agents) 
+                     if modified_actions[str(idx)][0] == 0)
+    unemployment_rate = unemployed / env.num_agents
+    
+    if unemployment_rate < 0.035:
+        need_unemployed = max(1, int(0.035 * env.num_agents) - unemployed)
+        employed_agents = [str(idx) for idx in range(env.num_agents) 
+                          if modified_actions[str(idx)][0] == 1]
+        if len(employed_agents) >= need_unemployed:
+            forced_unemployed = np.random.choice(employed_agents, 
+                                                size=need_unemployed, 
+                                                replace=False)
+            for agent_id in forced_unemployed:
+                modified_actions[agent_id][0] = 0
+                
+    elif unemployment_rate > 0.148:
+        need_employed = max(1, unemployed - int(0.148 * env.num_agents))
+        unemployed_agents = [str(idx) for idx in range(env.num_agents) 
+                            if modified_actions[str(idx)][0] == 0]
+        if len(unemployed_agents) >= need_employed:
+            forced_employed = np.random.choice(unemployed_agents, 
+                                              size=need_employed, 
+                                              replace=False)
+            for agent_id in forced_employed:
+                modified_actions[agent_id][0] = 1
+    
+    modified_actions['p'] = [0]
+    return modified_actions
+
+def gpt_actions(env, obs, dialog_queue, dialog4ref_queue, gpt_path, gpt_error, total_cost, model_type='gpt'):
     if not os.path.exists(gpt_path):
         os.makedirs(gpt_path)
     curr_rates = obs['p']['PeriodicBracketTax-curr_rates']
@@ -98,10 +224,10 @@ def gpt_actions(env, obs, dialog_queue, dialog4ref_queue, gpt_path, gpt_error, t
         else:
             return (actions[0] >= 0) & (actions[0] <= 1) & (actions[1] >= 0) & (actions[1] <= 1)
     if env.world.timestep%3 == 0 and env.world.timestep > 0:
-        results, cost = get_multiple_completion([list(dialogs)[:2] + list(dialog4ref)[-3:-1] + list(dialogs)[-1:] for dialogs, dialog4ref in zip(dialog_queue, dialog4ref_queue)])
+        results, cost = get_multiple_completion([list(dialogs)[:2] + list(dialog4ref)[-3:-1] + list(dialogs)[-1:] for dialogs, dialog4ref in zip(dialog_queue, dialog4ref_queue)], model_type=model_type)
         total_cost += cost
     else:
-        results, cost = get_multiple_completion([list(dialogs) for dialogs in dialog_queue])
+        results, cost = get_multiple_completion([list(dialogs) for dialogs in dialog_queue], model_type=model_type)
         total_cost += cost
     actions = {}
     for idx in range(env.num_agents):
@@ -132,7 +258,7 @@ def gpt_actions(env, obs, dialog_queue, dialog4ref_queue, gpt_path, gpt_error, t
         for idx in range(env.num_agents):
             # dialog_queue[idx].append({'role': 'user', 'content': reflection_prompt})
             dialog4ref_queue[idx].append({'role': 'user', 'content': reflection_prompt})
-        results, cost = get_multiple_completion([list(dialogs) for dialogs in dialog4ref_queue], temperature=0, max_tokens=200)
+        results, cost = get_multiple_completion([list(dialogs) for dialogs in dialog4ref_queue], temperature=0, max_tokens=200, model_type=model_type)
         total_cost += cost
         for idx in range(env.num_agents):
             content = results[idx]
@@ -188,7 +314,7 @@ def complex_actions(env, obs, beta=0.1, gamma=0.1, h=1):
     return actions
     
 
-def main(policy_model='gpt', num_agents=100, episode_length=240, dialog_len=3, beta=0.1, gamma=0.1, h=1, max_price_inflation=0.1, max_wage_inflation=0.05):
+def main(policy_model='gpt', num_agents=100, episode_length=240, enforce_micro_constraints=False, dialog_len=3, beta=0.1, gamma=0.1, h=1, max_price_inflation=0.1, max_wage_inflation=0.05):
     env_config['n_agents'] = num_agents
     env_config['episode_length'] = episode_length
     if policy_model == 'gpt':
@@ -218,16 +344,26 @@ def main(policy_model='gpt', num_agents=100, episode_length=240, dialog_len=3, b
         policy_model_save = f'{policy_model}-{beta}-{gamma}-{h}-{max_price_inflation}-{max_wage_inflation}'
     if policy_model == 'gpt':
         policy_model_save = f'{policy_model}-{dialog_len}-noperception-reflection-1'
+        if enforce_micro_constraints:
+            policy_model_save += '-constrained'
     policy_model_save = f'{policy_model_save}-{num_agents}agents-{episode_length}months'
     if not os.path.exists(f'{save_path}data/{policy_model_save}'):
         os.makedirs(f'{save_path}data/{policy_model_save}')
     if not os.path.exists(f'{save_path}figs/{policy_model_save}'):
         os.makedirs(f'{save_path}figs/{policy_model_save}')
+    prev_obs = None
     for epi in range(env.episode_length):
         if policy_model == 'gpt':
-            actions, gpt_error, total_cost = gpt_actions(env, obs, dialog_queue, dialog4ref_queue, f'{save_path}data/{policy_model_save}/dialogs', gpt_error, total_cost)
+            actions, gpt_error, total_cost = gpt_actions(env, obs, dialog_queue, dialog4ref_queue, f'{save_path}data/{policy_model_save}/dialogs', gpt_error, total_cost, model_type='qwen')
+            if enforce_micro_constraints:
+                actions = enforce_constraints(env, obs, actions, prev_obs)
+            prev_obs = obs
         elif policy_model == 'complex':
             actions = complex_actions(env, obs, beta=beta, gamma=gamma, h=h)
+            if enforce_micro_constraints:
+                actions = enforce_constraints(env, obs, actions, prev_obs)
+            prev_obs = obs
+
         obs, rew, done, info = env.step(actions)
         if (epi+1) % 3 == 0:
             print(f'step {epi+1} done, cost {time()-t:.1f}s')
