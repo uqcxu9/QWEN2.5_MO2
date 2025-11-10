@@ -22,72 +22,108 @@ env_config = run_configuration.get('env')
         
 def enforce_constraints(env, obs, actions, prev_obs):
     """
-    强制修正违反经济学约束的agent行为
+    渐进式约束强制（Gradual Constraint Enforcement）
     
-    修正3个微观约束：
-    1. MPC约束 [0.05, 0.9]
-    2. 储蓄率约束 [0.014, 0.318]
-    3. 失业率约束 [0.035, 0.148]
+    时间表：
+    - Month 0-12：完全不约束（alpha=0）
+    - Month 12-60：逐步收紧（alpha: 0→1）
+    - Month 60+：完全约束（alpha=1）
+    
+    关键改进：
+    1. 储蓄率下限从 0.5% 渐进到 1.4%
+    2. 失业率下限从 1% 渐进到 3.5%
+    3. 修正幅度按 alpha 比例调整
     """
     modified_actions = {}
+    timestep = env.world.timestep
     
-    # ========== 第1步：个体约束修正 ==========
+    # ========== 计算约束强度 alpha ==========
+    if timestep < 12:
+        alpha = 0.0  # 第一年：完全不约束
+    elif timestep < 60:
+        alpha = (timestep - 12) / 48  # 渐进期：线性增长
+    else:
+        alpha = 1.0  # 成熟期：完全约束
+    
+    # 如果不约束，直接返回
+    if alpha == 0.0:
+        for idx in range(env.num_agents):
+            modified_actions[str(idx)] = actions[str(idx)]
+        modified_actions['p'] = [0]
+        return modified_actions
+    
+    # 统计
+    stats = {
+        'mpc_violations': 0,
+        'mpc_fixed': 0,
+        'saving_violations': 0,
+        'saving_fixed': 0,
+        'mpc_checks': 0,
+        'saving_checks': 0
+    }
+    
+    # ========== 个体约束修正 ==========
     for idx in range(env.num_agents):
         agent_id = str(idx)
         this_agent = env.get_agent(agent_id)
         
-        # 提取当前决策
-        work_decision = actions[agent_id][0]  # 0或1
-        consumption_prop = actions[agent_id][1] * 0.02  # 转回比例[0, 1]
+        work_decision = actions[agent_id][0]
+        consumption_prop = actions[agent_id][1] * 0.02
         
-        # 计算当期财务状况
         curr_wealth = this_agent.inventory['Coin']
         max_l = env._components_dict['SimpleLabor'].num_labor_hours
         curr_potential_income = this_agent.state['skill'] * max_l * work_decision
         
-        # ========== 约束1: MPC修正 ==========
-        if prev_obs is not None and env.world.timestep > 0:
+        # ========== MPC约束 ==========
+        if prev_obs is not None and timestep > 0:
             try:
-                # 上期数据
                 prev_states = env.dense_log['states'][-1] if len(env.dense_log['states']) > 0 else None
                 if prev_states is not None:
                     prev_income = prev_states[agent_id]['income']['Coin']
                     prev_consumption = prev_states[agent_id]['consumption']['Coin']
-                    
-                    # 上期税务数据
                     prev_tax_data = env.dense_log['PeriodicTax'][-1] if len(env.dense_log['PeriodicTax']) > 0 else {}
                     prev_tax = prev_tax_data.get(agent_id, {}).get('tax_paid', 0)
                     
-                    # 当期税务数据
                     curr_tax = obs['p'][f'p{idx}']['PeriodicBracketTax-tax_paid']
                     lump_sum = obs['p'][f'p{idx}']['PeriodicBracketTax-lump_sum']
                     
-                    # 计算DPI变化
                     prev_dpi = prev_income - prev_tax
                     curr_dpi = curr_potential_income + lump_sum - curr_tax
                     delta_dpi = curr_dpi - prev_dpi
                     
-                    # 计算消费变化
                     planned_consumption = consumption_prop * (curr_wealth + curr_potential_income)
                     delta_consumption = planned_consumption - prev_consumption
                     
-                    # 检查MPC
-                    if abs(delta_dpi) > 100:
+                    # 渐进式阈值：50 → 25
+                    threshold = 50 * (1 - 0.5 * alpha)
+                    if abs(delta_dpi) > threshold:
+                        stats['mpc_checks'] += 1
                         mpc = delta_consumption / delta_dpi
                         
-                        if mpc < 0.05:
-                            target_consumption = prev_consumption + 0.05 * delta_dpi
+                        # 渐进式边界
+                        lower_bound = 0.02 + 0.03 * alpha  # 0.02 → 0.05
+                        upper_bound = 1.0 - 0.1 * alpha     # 1.0 → 0.9
+                        
+                        if mpc < lower_bound:
+                            stats['mpc_violations'] += 1
+                            stats['mpc_fixed'] += 1
+                            # 渐进式修正：只修正 50%*alpha
+                            target_mpc = lower_bound + (mpc - lower_bound) * (1 - alpha * 0.5)
+                            target_consumption = prev_consumption + target_mpc * delta_dpi
                             consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
                             consumption_prop = max(0.02, min(1.0, consumption_prop))
                             
-                        elif mpc > 0.9:
-                            target_consumption = prev_consumption + 0.9 * delta_dpi
+                        elif mpc > upper_bound:
+                            stats['mpc_violations'] += 1
+                            stats['mpc_fixed'] += 1
+                            target_mpc = upper_bound + (mpc - upper_bound) * (1 - alpha * 0.5)
+                            target_consumption = prev_consumption + target_mpc * delta_dpi
                             consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
                             consumption_prop = max(0.02, min(1.0, consumption_prop))
             except:
                 pass
         
-        # ========== 约束2: 储蓄率修正 ==========
+        # ========== 储蓄率约束（关键！）==========
         try:
             tax_paid = obs['p'][f'p{idx}']['PeriodicBracketTax-tax_paid']
             lump_sum = obs['p'][f'p{idx}']['PeriodicBracketTax-lump_sum']
@@ -96,52 +132,87 @@ def enforce_constraints(env, obs, actions, prev_obs):
             planned_consumption = consumption_prop * (curr_wealth + curr_potential_income)
             saving = dpi - planned_consumption
             
-            if dpi > 100:
+            # 渐进式阈值：50 → 25
+            threshold = 50 * (1 - 0.5 * alpha)
+            if dpi > threshold:
+                stats['saving_checks'] += 1
                 saving_rate = saving / dpi
                 
-                if saving_rate < 0.014:
-                    target_saving = 0.014 * dpi
-                    target_consumption = dpi - target_saving
+                # 🔥 关键：储蓄率下限渐进
+                lower_bound = 0.005 + 0.009 * alpha  # 0.5% → 1.4%
+                upper_bound = 0.318
+                
+                if saving_rate < lower_bound:
+                    stats['saving_violations'] += 1
+                    stats['saving_fixed'] += 1
+                    # 渐进式修正
+                    target_rate = lower_bound + (saving_rate - lower_bound) * (1 - alpha * 0.5)
+                    target_consumption = dpi * (1 - target_rate)
                     consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
                     consumption_prop = max(0.02, min(1.0, consumption_prop))
                     
-                elif saving_rate > 0.318:
-                    target_saving = 0.318 * dpi
-                    target_consumption = dpi - target_saving
+                elif saving_rate > upper_bound:
+                    stats['saving_violations'] += 1
+                    stats['saving_fixed'] += 1
+                    target_rate = upper_bound + (saving_rate - upper_bound) * (1 - alpha * 0.5)
+                    target_consumption = dpi * (1 - target_rate)
                     consumption_prop = target_consumption / (curr_wealth + curr_potential_income + 1e-8)
                     consumption_prop = max(0.02, min(1.0, consumption_prop))
         except:
             pass
         
-        # 保存修正后的决策
         modified_actions[agent_id] = [work_decision, int(consumption_prop / 0.02)]
     
-    # ========== 第2步：全局失业率调整 ==========
+    # ========== 失业率约束（关键！）==========
     unemployed = sum(1 for idx in range(env.num_agents) 
                      if modified_actions[str(idx)][0] == 0)
     unemployment_rate = unemployed / env.num_agents
     
-    if unemployment_rate < 0.035:
-        need_unemployed = max(1, int(0.035 * env.num_agents) - unemployed)
+    unemployment_adjusted = False
+    
+    # 🔥 关键：失业率下限渐进
+    lower_bound = 0.01 + 0.025 * alpha   # 1% → 3.5%
+    upper_bound = 0.148
+    
+    if unemployment_rate < lower_bound:
+        unemployment_adjusted = True
+        target_unemployed = int(lower_bound * env.num_agents)
+        # 渐进式调整：只调整 50%*alpha
+        adjust_count = max(1, int((target_unemployed - unemployed) * alpha * 0.5))
         employed_agents = [str(idx) for idx in range(env.num_agents) 
                           if modified_actions[str(idx)][0] == 1]
-        if len(employed_agents) >= need_unemployed:
+        if len(employed_agents) >= adjust_count:
             forced_unemployed = np.random.choice(employed_agents, 
-                                                size=need_unemployed, 
+                                                size=adjust_count, 
                                                 replace=False)
             for agent_id in forced_unemployed:
                 modified_actions[agent_id][0] = 0
                 
-    elif unemployment_rate > 0.148:
-        need_employed = max(1, unemployed - int(0.148 * env.num_agents))
+    elif unemployment_rate > upper_bound:
+        unemployment_adjusted = True
+        target_unemployed = int(upper_bound * env.num_agents)
+        adjust_count = max(1, int((unemployed - target_unemployed) * alpha * 0.5))
         unemployed_agents = [str(idx) for idx in range(env.num_agents) 
                             if modified_actions[str(idx)][0] == 0]
-        if len(unemployed_agents) >= need_employed:
+        if len(unemployed_agents) >= adjust_count:
             forced_employed = np.random.choice(unemployed_agents, 
-                                              size=need_employed, 
+                                              size=adjust_count, 
                                               replace=False)
             for agent_id in forced_employed:
                 modified_actions[agent_id][0] = 1
+    
+    # 调试输出
+    if timestep % 20 == 0 and timestep > 0:
+        print(f"\n{'='*60}")
+        print(f"[Gradual Constraint @ Step {timestep}]")
+        print(f"{'='*60}")
+        print(f"Constraint Strength (alpha): {alpha:.2%}")
+        print(f"  - Saving lower: {(0.005 + 0.009 * alpha):.2%} (target: 1.4%)")
+        print(f"  - Unemployment lower: {(0.01 + 0.025 * alpha):.2%} (target: 3.5%)")
+        print(f"\nMPC: checks={stats['mpc_checks']}, fixed={stats['mpc_fixed']}")
+        print(f"Saving: checks={stats['saving_checks']}, fixed={stats['saving_fixed']}")
+        print(f"Unemployment: {unemployment_rate:.2%}, adjusted={'Yes' if unemployment_adjusted else 'No'}")
+        print(f"{'='*60}\n")
     
     modified_actions['p'] = [0]
     return modified_actions
